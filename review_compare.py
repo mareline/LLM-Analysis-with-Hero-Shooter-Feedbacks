@@ -1,8 +1,8 @@
 """Compare Steam review themes for Overwatch 2 vs Marvel Rivals.
 
-Pulls recent English Steam reviews for each game, asks an Azure OpenAI model to
-label each review's sentiment and themes (from a fixed, hand-defined taxonomy),
-then checks the labels before reporting anything:
+Pulls recent English Steam reviews for each game, asks a local LLM (via Ollama)
+to label each review's sentiment and themes (from a fixed, hand-defined
+taxonomy), then checks the labels before reporting anything:
 
   * output validation  - every LLM answer must be valid JSON with an allowed
                          sentiment and only allowed themes, or it is retried
@@ -15,11 +15,11 @@ then checks the labels before reporting anything:
 It also writes a blind audit sample (review text only) for hand labeling;
 score_audit.py turns those labels into an accuracy figure.
 
-Requires env vars AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY and
-AZURE_OPENAI_DEPLOYMENT (optionally AZURE_OPENAI_API_VERSION).
+Requires the Ollama app running with the model pulled (ollama pull llama3.1:8b).
 
 Usage:
     python review_compare.py --n 200
+    python review_compare.py --model qwen2.5:7b --out output_qwen
 """
 
 import argparse
@@ -57,6 +57,7 @@ THEMES = {
 SENTIMENTS = ("positive", "negative", "mixed")
 
 STEAM_URL = "https://store.steampowered.com/appreviews/{appid}"
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MAX_REVIEW_CHARS = 2000
 
 SYSTEM_PROMPT = (
@@ -122,20 +123,16 @@ def fetch_reviews(appid, n, min_chars, sleep=0.5):
 
 # ---------------------------------------------------------------- LLM
 
-def make_client():
-    missing = [v for v in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_DEPLOYMENT")
-               if not os.environ.get(v)]
-    if missing:
-        sys.exit(f"Missing environment variable(s): {', '.join(missing)}")
-    from openai import AzureOpenAI
-
-    client = AzureOpenAI(
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_key=os.environ["AZURE_OPENAI_API_KEY"],
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21"),
-        max_retries=5,
-    )
-    return client, os.environ["AZURE_OPENAI_DEPLOYMENT"]
+def check_ollama(model):
+    """Exit with a clear message if Ollama isn't running or the model isn't pulled."""
+    try:
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+    except requests.RequestException:
+        sys.exit(f"Can't reach Ollama at {OLLAMA_URL}. Is the Ollama app running?")
+    pulled = {m["name"] for m in resp.json().get("models", [])}
+    if model not in pulled and f"{model}:latest" not in pulled:
+        sys.exit(f"Model {model!r} isn't downloaded. Run: ollama pull {model}")
 
 
 def validate(raw):
@@ -157,41 +154,47 @@ def validate(raw):
 
 
 class Classifier:
-    def __init__(self, client, deployment, attempts=3):
-        self.client, self.deployment, self.attempts = client, deployment, attempts
-        # Some newer Azure models reject temperature; we drop it once if so.
-        self.use_temperature = True
+    def __init__(self, model, attempts=3):
+        self.model, self.attempts = model, attempts
 
-    def _call(self, text):
-        kwargs = {
-            "model": self.deployment,
+    def _call(self, text, feedback=()):
+        resp = requests.post(f"{OLLAMA_URL}/api/chat", timeout=300, json={
+            "model": self.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text[:MAX_REVIEW_CHARS]},
+                *feedback,
             ],
-            "response_format": {"type": "json_object"},
-        }
-        if self.use_temperature:
-            kwargs["temperature"] = 0
-        try:
-            resp = self.client.chat.completions.create(**kwargs)
-        except Exception as e:
-            if self.use_temperature and "temperature" in str(e).lower():
-                self.use_temperature = False
-                return self._call(text)
-            raise
-        return resp.choices[0].message.content or ""
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0},
+        })
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
 
     def classify(self, text):
-        """Returns dict with llm_sentiment, llm_themes, llm_error (one of them empty)."""
-        error = ""
-        for _ in range(self.attempts):
+        """Returns dict with llm_sentiment, llm_themes, llm_error (one of them empty)
+        and llm_attempts.
+
+        An invalid answer is sent back to the model with the validation error so it
+        can correct itself; after `attempts` tries the review is recorded as failed."""
+        error, feedback = "", []
+        for attempt in range(1, self.attempts + 1):
+            raw = None
             try:
-                sentiment, themes = validate(self._call(text))
-                return {"llm_sentiment": sentiment, "llm_themes": "|".join(themes), "llm_error": ""}
+                raw = self._call(text, feedback)
+                sentiment, themes = validate(raw)
+                return {"llm_sentiment": sentiment, "llm_themes": "|".join(themes), "llm_error": "",
+                        "llm_attempts": attempt}
             except Exception as e:  # invalid output or API error: retry, then record
                 error = f"{type(e).__name__}: {e}"[:300]
-        return {"llm_sentiment": "", "llm_themes": "", "llm_error": error}
+                if raw is not None:  # the model answered but broke the rules
+                    feedback = [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": f"That answer is invalid ({e}). "
+                                                    "Reply again with corrected JSON only."},
+                    ]
+        return {"llm_sentiment": "", "llm_themes": "", "llm_error": error, "llm_attempts": self.attempts}
 
 
 # ---------------------------------------------------------------- analysis
@@ -276,7 +279,7 @@ def audit_sample(df, per_game, seed):
 def run(games, args):
     os.makedirs(args.out, exist_ok=True)
     if not args.fetch_only:
-        client, deployment = make_client()  # fail fast on missing keys, before downloading
+        check_ollama(args.model)  # fail fast, before downloading
 
     frames = []
     for game, appid in games.items():
@@ -293,8 +296,8 @@ def run(games, args):
         print(f"--fetch-only: wrote {len(df)} reviews to {args.out}/reviews_raw.csv")
         return 0
 
-    clf = Classifier(client, deployment)
-    print(f"Classifying {len(df)} reviews with Azure OpenAI ({args.workers} workers)...")
+    clf = Classifier(args.model)
+    print(f"Classifying {len(df)} reviews with {args.model} ({args.workers} workers)...")
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(clf.classify, df["review_text"]))
     df = pd.concat([df, pd.DataFrame(results)], axis=1)
@@ -312,6 +315,7 @@ def run(games, args):
     with open(os.path.join(args.out, "run_summary.json"), "w") as f:
         json.dump({
             "run_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "model": args.model,
             "n_requested_per_game": args.n,
             "min_review_chars": args.min_chars,
             "overall_failure_rate": overall_fail,
@@ -353,6 +357,7 @@ def run(games, args):
 
 def parse_args(argv=None, default_out="output_compare"):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default="llama3.1:8b", help="Ollama model (default llama3.1:8b)")
     p.add_argument("--n", type=int, default=200, help="reviews per game (default 200)")
     p.add_argument("--out", default=default_out, help=f"output folder (default {default_out})")
     p.add_argument("--min-chars", type=int, default=40,
